@@ -1,22 +1,25 @@
 import os
 import tempfile
-import logging
+ 
 from datetime import timedelta
 import json
 import streamlit as st
 from yt_dlp import YoutubeDL
 from faster_whisper import WhisperModel
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.chains.summarize import load_summarize_chain
 from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
 from dotenv import load_dotenv
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_openai import ChatOpenAI
 
+
+embedding = OllamaEmbeddings(model="nomic-embed-text")
 # --- Configuration ---
-# Set up basic logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+ 
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,22 +36,23 @@ class VideoSummarizer:
         """
         Initializes the summarizer with Whisper and OpenAI models.
         """
-        logging.info("Initializing models...")
+    print("Initializing models...")
         # For better performance on compatible hardware, you can change device to "cuda"
         # and compute_type to "float16".
         self.whisper_model = WhisperModel(
             model_size, device=device, compute_type=compute_type
         )
         # self.llm = ChatOpenAI(temperature=0, model_name="gpt-4o")
+
         self.llm = ChatOllama(model="llama3.2", temperature=0.2)
-        logging.info("Models initialized successfully.")
+    print("Models initialized successfully.")
 
     def _download_audio(self, url: str, temp_dir: str) -> str:
         """
         Downloads audio from a YouTube URL to a temporary directory.
         Returns the path to the downloaded audio file.
         """
-        logging.info(f"Downloading audio from URL: {url}")
+    print(f"Downloading audio from URL: {url}")
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
@@ -72,13 +76,11 @@ class VideoSummarizer:
         Transcribes the audio file using the Whisper model.
         Returns the transcription segments and language information.
         """
-        logging.info(f"Transcribing audio file: {audio_path}")
+    print(f"Transcribing audio file: {audio_path}")
         segments, info = self.whisper_model.transcribe(
             audio_path, word_timestamps=False
         )
-        logging.info(
-            f"Detected language '{info.language}' with probability {info.language_probability}"
-        )
+    print(f"Detected language '{info.language}' with probability {info.language_probability}")
         return list(segments), info
 
     def _format_timestamp(self, seconds: float) -> str:
@@ -145,11 +147,13 @@ class VideoSummarizer:
 
         return chapters
 
-    def generate_summary(self, youtube_url: str) -> dict:
+    def generate_summary(self, youtube_url: str) -> tuple[dict, list]:
         """
         The main method to generate a full summary from a YouTube URL.
+        Returns the summary dictionary and the list of transcript documents.
         """
-        # Note: Using Ollama, so no need for OPENAI_API_KEY check
+        if not os.getenv("OPENAI_API_KEY"):
+            raise EnvironmentError("OPENAI_API_KEY not found in .env file.")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_path = self._download_audio(youtube_url, temp_dir)
@@ -160,11 +164,11 @@ class VideoSummarizer:
                 for seg in segments
             ]
 
-            logging.info("Generating executive summary...")
+            print("Generating executive summary...")
             summary_chain = load_summarize_chain(self.llm, chain_type="map_reduce")
             executive_summary = summary_chain.run(docs)
 
-            logging.info("Generating chapters...")
+            print("Generating chapters...")
             chapter_chunks = self._group_segments_for_chapters(segments)
             chapters = []
             title_prompt = PromptTemplate.from_template(
@@ -181,7 +185,7 @@ class VideoSummarizer:
                 timestamp = self._format_timestamp(chunk["start"])
                 chapters.append({"timestamp": timestamp, "title": title})
 
-            logging.info("Generating key takeaways...")
+            print("Generating key takeaways...")
             takeaways_chain = load_summarize_chain(
                 llm=self.llm,
                 chain_type="refine",
@@ -200,51 +204,13 @@ class VideoSummarizer:
                 if item.strip()
             ]
 
-            # Store full transcript for chat functionality
-            full_transcript = " ".join(seg.text for seg in segments)
-
-            return {
+            summary_result = {
                 "executive_summary": executive_summary,
                 "chapters": chapters,
                 "key_takeaways": key_takeaways,
-                "full_transcript": full_transcript,
                 "metadata": {"url": youtube_url, "language": info.language},
             }
-
-    def chat_with_video(
-        self, question: str, transcript: str, chat_history: list = None
-    ) -> str:
-        """
-        Chat with the video content using the transcript.
-        """
-        if chat_history is None:
-            chat_history = []
-
-        # Create context with chat history
-        context_parts = [f"Video Transcript:\n{transcript}\n"]
-
-        if chat_history:
-            context_parts.append("Previous conversation:")
-            for q, a in chat_history:
-                context_parts.append(f"Q: {q}")
-                context_parts.append(f"A: {a}")
-
-        context_parts.append(f"\nNew Question: {question}")
-        context_parts.append(
-            "\nPlease answer the question based on the video transcript above. If the answer is not in the transcript, say so clearly."
-        )
-
-        context = "\n".join(context_parts)
-
-        chat_prompt = PromptTemplate.from_template(
-            "You are a helpful assistant that answers questions about a video based on its transcript. "
-            "Be accurate and only use information from the provided transcript. "
-            "If something is not mentioned in the transcript, clearly state that.\n\n"
-            "{context}\n\nAnswer:"
-        )
-
-        response = self.llm.invoke(chat_prompt.format(context=context))
-        return response.content.strip()
+            return summary_result, docs
 
 
 def to_markdown(summary_data: dict, url: str) -> str:
@@ -279,7 +245,7 @@ def get_summarizer():
 
 
 st.set_page_config(
-    page_title="YouTube Video Summarizer",
+    page_title="ClipNotes: YouTube Summarizer & Chat",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -300,35 +266,46 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🎬 YouTube Video Summarizer")
+st.title("🎬 ClipNotes: YouTube Summarizer & Chat")
 st.markdown(
-    "This tool takes a YouTube URL, transcribes the audio, and generates a summary, chapters, and key takeaways using AI. "
-    "It uses Ollama for local LLM processing and includes a chat feature to ask questions about the video content."
+    "This tool takes a YouTube URL, generates a summary, and lets you chat with the video's content."
 )
 
-# Note: Since we're using Ollama, we don't need OPENAI_API_KEY
-# But we should check if Ollama is running
-# if not os.getenv("OPENAI_API_KEY"):
-#     st.error("OPENAI_API_KEY not found. Please create a `.env` file and add your key.")
-#     st.info('Example `.env` file content:\n`OPENAI_API_KEY="your-sk-key-here"`')
-#     st.stop()
+if not os.getenv("OPENAI_API_KEY"):
+    st.error("OPENAI_API_KEY not found. Please create a `.env` file and add your key.")
+    st.info('Example `.env` file content:\n`OPENAI_API_KEY="your-sk-key-here"`')
+    st.stop()
 
 with st.form("url_form"):
     url_input = st.text_input(
         "Enter YouTube URL:", placeholder="https://www.youtube.com/watch?v=..."
     )
-    submitted = st.form_submit_button("✨ Generate Summary")
+    submitted = st.form_submit_button("✨ Generate Summary & Chat")
 
 if submitted and url_input:
-    # Use the cached factory function to get the summarizer instance
+    # When a new URL is submitted, clear old data
+    keys_to_clear = ["summary_data", "video_url", "qa_chain", "messages"]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
     summarizer = get_summarizer()
     with st.spinner(
         "Summarizing... This can take a few minutes for longer videos. Please wait."
     ):
         try:
-            summary_data = summarizer.generate_summary(url_input)
+            summary_data, docs = summarizer.generate_summary(url_input)
             st.session_state["summary_data"] = summary_data
             st.session_state["video_url"] = url_input
+
+            with st.spinner("Indexing video content for chat..."):
+                embeddings = OpenAIEmbeddings()
+                vectorstore = FAISS.from_documents(docs, embeddings)
+                st.session_state["qa_chain"] = RetrievalQA.from_chain_type(
+                    llm=summarizer.llm,
+                    chain_type="stuff",
+                    retriever=vectorstore.as_retriever(),
+                )
         except Exception as e:
             st.error(f"An error occurred: {e}")
             st.exception(e)
@@ -339,8 +316,8 @@ if "summary_data" in st.session_state:
     summary_data = st.session_state["summary_data"]
     video_url = st.session_state["video_url"]
 
+    # --- Display Summary ---
     col1, col2 = st.columns([2, 1])
-
     with col1:
         st.subheader("📝 Executive Summary")
         st.write(summary_data["executive_summary"])
@@ -359,84 +336,48 @@ if "summary_data" in st.session_state:
                 f"**[{chapter['timestamp']}]({chapter_url})** - {chapter['title']}"
             )
 
+    # --- Export Options ---
     st.subheader("📥 Export Summary")
     export_col1, export_col2 = st.columns(2)
-
     markdown_output = to_markdown(summary_data, video_url)
     json_output = json.dumps(summary_data, indent=2, ensure_ascii=False)
-
     with export_col1:
         st.download_button(
-            label="Download as Markdown (.md)",
-            data=markdown_output,
-            file_name="video_summary.md",
-            mime="text/markdown",
+            "Download as Markdown (.md)", markdown_output, "summary.md", "text/markdown"
         )
     with export_col2:
         st.download_button(
-            label="Download as JSON (.json)",
-            data=json_output,
-            file_name="video_summary.json",
-            mime="application/json",
+            "Download as JSON (.json)", json_output, "summary.json", "application/json"
         )
 
-    # Initialize chat history if not exists
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = []
+    # --- Chat Interface ---
+    st.markdown("---")
+    st.header("💬 Chat with the Video")
 
-    # Chat with Video Section
-    st.subheader("💬 Chat with Video")
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        st.markdown("Ask questions about the video content!")
-    with col2:
-        if st.button("Clear Chat", type="secondary"):
-            st.session_state["chat_history"] = []
-            st.rerun()
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    # Display chat history
-    if st.session_state["chat_history"]:
-        st.markdown("**Previous conversation:**")
-        for i, (question, answer) in enumerate(st.session_state["chat_history"]):
-            with st.expander(
-                f"Q{i + 1}: {question[:50]}..."
-                if len(question) > 50
-                else f"Q{i + 1}: {question}"
-            ):
-                st.markdown(f"**Question:** {question}")
-                st.markdown(f"**Answer:** {answer}")
+    if prompt := st.chat_input("Ask a question about the video's content"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    # Chat input
-    with st.form("chat_form"):
-        user_question = st.text_input(
-            "Ask a question about the video:",
-            placeholder="What is this video about? What are the main points discussed?",
-        )
-        chat_submitted = st.form_submit_button("Ask Question")
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            with st.spinner("Thinking..."):
+                qa_chain = st.session_state.get("qa_chain")
+                if qa_chain:
+                    response = qa_chain.run(prompt)
+                    message_placeholder.markdown(response)
+                else:
+                    response = "Sorry, the chat functionality isn't ready."
+                    message_placeholder.markdown(response)
 
-    if chat_submitted and user_question:
-        summarizer = get_summarizer()
-        with st.spinner("Thinking..."):
-            try:
-                # Get the answer using the chat method
-                answer = summarizer.chat_with_video(
-                    user_question,
-                    summary_data["full_transcript"],
-                    st.session_state["chat_history"],
-                )
-
-                # Add to chat history
-                st.session_state["chat_history"].append((user_question, answer))
-
-                # Display the answer
-                st.markdown("**Your Question:**")
-                st.write(user_question)
-                st.markdown("**Answer:**")
-                st.write(answer)
-
-            except Exception as e:
-                st.error(f"Error answering question: {e}")
+        st.session_state.messages.append({"role": "assistant", "content": response})
 
 elif submitted and not url_input:
     st.warning("Please enter a YouTube URL to summarize.")
