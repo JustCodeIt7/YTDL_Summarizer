@@ -206,3 +206,5 @@ Plotly_Dash_Dashboards/01-Plotly_Basics_Charts/12-Sankey_Diagram/archive
 # Except for this one
 !/.github/
 audio.mp3.mp3
+app_chat-v2.py
+.gitignore
